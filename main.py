@@ -193,14 +193,25 @@ def _generic_construct(query_lower, original_query, tools, likely_multi):
     scored_tools.sort(key=lambda x: x[0], reverse=True)
 
     if likely_multi:
-        # Return all tools that scored > 0 and have filled params
-        calls = []
+        # Estimate how many tools are needed from the query
+        and_count = query_lower.count(" and ")
+        comma_count = query_lower.count(",")
+        expected_count = max(and_count + 1, comma_count + 1) if (and_count or comma_count) else 2
+
+        # Filter: minimum score threshold AND only keep top N tools
+        min_score = max(4, scored_tools[0][0] * 0.4)  # at least 40% of best score
+        print(f"[DEBUG-GENERIC] All scores: {[(s, t['name']) for s, t, a in scored_tools]}")
+        print(f"[DEBUG-GENERIC] Min score: {min_score}, Expected count: {expected_count}")
+        filtered = []
         used_tools = set()
         for score, tool, args in scored_tools:
-            if tool["name"] not in used_tools:
-                calls.append({"name": tool["name"], "arguments": args})
+            if score >= min_score and tool["name"] not in used_tools:
+                filtered.append({"name": tool["name"], "arguments": args})
                 used_tools.add(tool["name"])
-        return calls if len(calls) >= 2 else None
+            if len(filtered) >= expected_count:
+                break
+        print(f"[DEBUG-GENERIC] Filtered calls: {json.dumps(filtered, indent=2)}")
+        return filtered if len(filtered) >= 2 else None
     else:
         # Single tool — return highest scoring
         best_score, best_tool, best_args = scored_tools[0]
@@ -400,7 +411,7 @@ def _extract_param_value(query_lower, original_query, param_name, param_type, pa
 
         # --- Message content ---
         if any(kw in param_desc_lower for kw in ["message", "content", "body", "text"]):
-            match = re.search(r'saying\s+(.+?)(?:\.|!|$|,\s*(?:and|check|set|remind|find|look|play))', query_lower)
+            match = re.search(r'saying\s+(.+?)(?:\.|!|$|,\s*(?:and|check|set|remind|find|look|play)|\s+and\s+)', query_lower)
             if match:
                 return match.group(1).strip().rstrip('.,!?')
 
@@ -430,11 +441,29 @@ def _extract_param_value(query_lower, original_query, param_name, param_type, pa
 
         # --- Time as string ---
         if "time" in param_desc_lower and "time" not in param_name_lower.replace("time", "x"):
-            # Look for time patterns like "3:00 PM", "5 PM"
-            # For tools with both hour(int) and time(str), this handles the string version
-            match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm))', query_lower)
-            if match:
-                time_str = match.group(1).strip().upper()
+            # For tools like create_reminder, find time NEAR the tool's action context
+            # Look for "at TIME" pattern after the tool's action verb
+            tool_verbs = tool_name.lower().replace("_", " ").split()
+            # Find position of tool's verb in query to get nearby time
+            verb_pos = -1
+            for v in tool_verbs:
+                pos = query_lower.find(v)
+                if pos >= 0:
+                    verb_pos = max(verb_pos, pos)
+
+            # Find all time patterns
+            time_matches = list(re.finditer(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm))', query_lower))
+
+            if time_matches:
+                # Pick the time closest to (and after) the tool's verb
+                best_match = time_matches[-1]  # default to last
+                if verb_pos >= 0:
+                    for tm in time_matches:
+                        if tm.start() > verb_pos:
+                            best_match = tm
+                            break
+
+                time_str = best_match.group(1).strip().upper()
                 if ':' not in time_str:
                     time_str = re.sub(r'(\d+)\s*(AM|PM)', r'\1:00 \2', time_str)
                 else:
