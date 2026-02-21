@@ -4,6 +4,7 @@ sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
 import json, os, time
+import concurrent.futures
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
@@ -72,7 +73,7 @@ def generate_cloud(messages, tools):
     start_time = time.time()
 
     gemini_response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         contents=contents,
         config=types.GenerateContentConfig(tools=gemini_tools),
     )
@@ -93,20 +94,78 @@ def generate_cloud(messages, tools):
         "total_time_ms": total_time_ms,
     }
 
+#Hitika idea due to the Paris query
+def generate_hybrid(messages, tools, confidence_threshold=0.85):
+    """Threshold 0.99 + validation + fix negatives locally."""
 
-def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
     local = generate_cactus(messages, tools)
+    user_query = messages[-1]["content"]
+    print(f"\n[DEBUG] Query: {user_query}")
+    print(f"[DEBUG] Confidence: {local['confidence']}")
+    print(f"[DEBUG] Function calls: {json.dumps(local['function_calls'], indent=2)}")
+    print(f"[DEBUG] Tools available: {[t['name'] for t in tools]}")
+    calls = local.get("function_calls", [])
 
-    if local["confidence"] >= confidence_threshold:
-        local["source"] = "on-device"
-        return local
+    # --- Baseline confidence check ---
+    if local["confidence"] < confidence_threshold:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (fallback)"
+        cloud["local_confidence"] = local["confidence"]
+        cloud["total_time_ms"] += local["total_time_ms"]
+        return cloud
 
-    cloud = generate_cloud(messages, tools)
-    cloud["source"] = "cloud (fallback)"
-    cloud["local_confidence"] = local["confidence"]
-    cloud["total_time_ms"] += local["total_time_ms"]
-    return cloud
+    # --- Validation 1: No empty function calls ---
+    if not calls:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (fallback)"
+        cloud["local_confidence"] = local["confidence"]
+        cloud["total_time_ms"] += local["total_time_ms"]
+        return cloud
+
+    # --- Fix: Convert negative numeric values to positive ---
+    # FunctionGemma sometimes negates numbers. The right function
+    # and right magnitude, just wrong sign. Fix it locally.
+    for call in calls:
+        args = call.get("arguments", {})
+        for key in args:
+            if isinstance(args[key], (int, float)) and args[key] < 0:
+                args[key] = abs(args[key])
+
+    # --- Validation 2: Multi-tool queries need multiple calls ---
+    user_query = ""
+    for m in messages:
+        if m["role"] == "user":
+            user_query = m["content"].lower()
+
+    multi_keywords = [" and ", " also ", " then ", " plus "]
+    likely_multi = any(kw in f" {user_query} " for kw in multi_keywords)
+
+    if likely_multi and len(calls) < 2:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"] = "cloud (fallback)"
+        cloud["local_confidence"] = local["confidence"]
+        cloud["total_time_ms"] += local["total_time_ms"]
+        return cloud
+
+    # --- All checks passed, trust local ---
+    local["source"] = "on-device"
+    return local
+
+# Original GENERATE HYBRID function
+# def generate_hybrid(messages, tools, confidence_threshold=0.99):
+#     """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
+#         local = generate_cactus(messages, tools)
+#
+#         if local["confidence"] >= confidence_threshold:
+#             local["source"] = "on-device"
+#             return local
+#
+#         cloud = generate_cloud(messages, tools)
+#         cloud["source"] = "cloud (fallback)"
+#         cloud["local_confidence"] = local["confidence"]
+#         cloud["total_time_ms"] += local["total_time_ms"]
+#         return cloud
+
 
 
 def print_result(label, result):
