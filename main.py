@@ -189,7 +189,11 @@ def generate_hybrid(messages, tools, confidence_threshold=0.85):
     # =========================================================
     local = generate_cactus(messages, tools)
     calls = local.get("function_calls", [])
-
+    print(f"\n[DEBUG] Query: {user_query}")
+    print(f"[DEBUG] Confidence: {local.get('confidence', 0)}")
+    print(f"[DEBUG] FunctionGemma calls: {json.dumps(calls, indent=2)}")
+    print(f"[DEBUG] Tools available: {[t['name'] for t in tools]}")
+    print(f"[DEBUG] Likely multi: {likely_multi}")
     # =========================================================
     # STEP 2: Confidence check
     # =========================================================
@@ -229,7 +233,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.85):
 
         # Rank tools by semantic similarity against precomputed vectors
         needed_tool_names = _detect_needed_tools(user_query, tool_vecs, top_n=top_n)
-
+        print(f"[DEBUG-EMBED] Needed tools (top {top_n}): {needed_tool_names}")
         if not needed_tool_names:
             return _cloud_fallback(messages, tools, local)
 
@@ -244,6 +248,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.85):
                 continue
 
             result = generate_cactus(messages, [tool])
+            print(f"[DEBUG-EMBED] Tool {tool_name}: conf={result.get('confidence', 0)}, calls={result.get('function_calls', [])}")
             total_time += result.get("total_time_ms", 0)
             conf = result.get("confidence", 0)
             min_confidence = min(min_confidence, conf)
@@ -363,7 +368,10 @@ def _try_construct_calls(query, tool_names, likely_multi):
 
     # Return None if we couldn't construct anything
     if not calls:
+        print(f"[DEBUG-REGEX] No calls constructed")
         return None
+
+    print(f"[DEBUG-REGEX] Constructed: {json.dumps(calls, indent=2)}")
 
     # For single-tool queries, return what we found
     if not likely_multi:
@@ -372,7 +380,7 @@ def _try_construct_calls(query, tool_names, likely_multi):
     # For multi-tool queries, only return if we got 2+
     if len(calls) >= 2:
         return calls
-
+    print(f"[DEBUG-REGEX] Multi-tool but only {len(calls)} call, returning None")
     return None
 
 def print_result(label, result):
