@@ -154,7 +154,7 @@ def _fix_negatives(calls: list):
                 call["arguments"][k] = abs(v)
 
 
-def generate_hybrid(messages, tools, confidence_threshold=0.85):
+def generate_hybrid(messages, tools, confidence_threshold=0.93):
     """
     Strategy:
     1. Run FunctionGemma locally
