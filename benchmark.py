@@ -9,6 +9,7 @@ from main import generate_hybrid
 
 ############## Tool definitions ##############
 
+
 TOOL_GET_WEATHER = {
     "name": "get_weather",
     "description": "Get current weather for a location",

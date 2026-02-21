@@ -83,12 +83,13 @@ def generate_cloud(messages, tools):
 
     function_calls = []
     for candidate in gemini_response.candidates:
-        for part in candidate.content.parts:
-            if part.function_call:
-                function_calls.append({
-                    "name": part.function_call.name,
-                    "arguments": dict(part.function_call.args),
-                })
+        if candidate.content and candidate.content.parts:    # ← added safety check
+            for part in candidate.content.parts:
+                if part.function_call:
+                    function_calls.append({
+                        "name": part.function_call.name,
+                        "arguments": dict(part.function_call.args),
+                    })
 
     return {
         "function_calls": function_calls,
@@ -421,7 +422,7 @@ def _extract_param_value(query_lower, original_query, param_name, param_type, pa
             if match:
                 song = match.group(1).strip().rstrip('.,!?')
                 # Only strip "some/the" prefix
-                song = re.sub(r'^(?:some|the)\s+', '', song)
+                song = re.sub(r'\s+music$', '', song)
                 return song
 
         # --- Title/subject ---
