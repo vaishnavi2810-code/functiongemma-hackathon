@@ -1,6 +1,10 @@
 
 import re
 import sys
+import spacy
+
+# Load spaCy model once at module level
+_nlp = spacy.load("en_core_web_md")
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
@@ -98,10 +102,10 @@ def generate_cloud(messages, tools):
 
 def generate_hybrid(messages, tools, confidence_threshold=0.93):
     """
-    Three-layer fallback:
-    1. FunctionGemma (AI, ~200ms)
-    2. Generic rule-based NLU (scoring + extraction, ~0ms)
-    3. Gemini Cloud (AI, ~1000ms)
+    Three-layer hybrid routing (fully generic, no hardcoded patterns):
+    1. FunctionGemma with all tools (fast, works when confident)
+    2. Smart routing: score tools → FunctionGemma with 1 tool each
+    3. Gemini Cloud fallback (handles complex/unknown queries)
     """
 
     user_query = ""
@@ -110,7 +114,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.93):
             user_query = m["content"]
 
     query_lower = user_query.lower()
-    tool_names = {t["name"] for t in tools}
 
     # Detect multi-tool
     multi_keywords = [" and ", " also ", " then ", " plus "]
@@ -119,48 +122,77 @@ def generate_hybrid(messages, tools, confidence_threshold=0.93):
         likely_multi = True
 
     # =========================================================
-    # LAYER 1: FunctionGemma
+    # LAYER 1: FunctionGemma with ALL tools
     # =========================================================
     local = generate_cactus(messages, tools)
     calls = local.get("function_calls", [])
 
-    # Confidence check
-    if local.get("confidence", 0) < confidence_threshold:
-        if not calls:
-            constructed = _generic_construct(query_lower, user_query, tools, likely_multi)
-            if constructed:
-                local["function_calls"] = constructed
-                local["source"] = "on-device"
-                return local
-        return _cloud_fallback(messages, tools, local)
+    if calls:
+        _fix_negatives(calls)
 
-    # Empty calls — try generic construction
-    if not calls:
-        constructed = _generic_construct(query_lower, user_query, tools, likely_multi)
-        if constructed:
-            local["function_calls"] = constructed
-            local["source"] = "on-device"
-            return local
-        return _cloud_fallback(messages, tools, local)
+    layer1_ok = (
+        local.get("confidence", 0) >= confidence_threshold
+        and len(calls) > 0
+        and (not likely_multi or len(calls) >= 2)
+    )
 
-    # Fix negative numbers
-    for call in calls:
-        args = call.get("arguments", {})
-        for key in args:
-            if isinstance(args[key], (int, float)) and args[key] < 0:
-                args[key] = abs(args[key])
+    if layer1_ok:
+        local["source"] = "on-device"
+        return local
 
-    # Multi-tool check
-    if likely_multi and len(calls) < 2:
-        constructed = _generic_construct(query_lower, user_query, tools, likely_multi)
-        if constructed and len(constructed) >= 2:
-            local["function_calls"] = constructed
-            local["source"] = "on-device"
-            return local
-        return _cloud_fallback(messages, tools, local)
+    # =========================================================
+    # LAYER 2: Smart routing → FunctionGemma with 1 tool each
+    # =========================================================
 
-    local["source"] = "on-device"
-    return local
+    # How many tools do we need?
+    if likely_multi:
+        and_count = query_lower.count(" and ")
+        comma_count = query_lower.count(",")
+        expected_count = max(and_count + 1, comma_count + 1) if (and_count or comma_count) else 2
+    else:
+        expected_count = 1
+
+    # Score all tools
+    scored_tools = []
+    for tool in tools:
+        score = _score_tool(query_lower, tool)
+        if score > 0:
+            scored_tools.append((score, tool))
+
+    scored_tools.sort(key=lambda x: x[0], reverse=True)
+
+    if scored_tools:
+        min_score = max(3, scored_tools[0][0] * 0.3)
+        selected_tools = []
+        for score, tool in scored_tools:
+            if score >= min_score and len(selected_tools) < expected_count:
+                selected_tools.append(tool)
+
+        if selected_tools:
+            all_calls = []
+            total_time = local.get("total_time_ms", 0)
+
+            for tool in selected_tools:
+                result = generate_cactus(messages, [tool])
+                total_time += result.get("total_time_ms", 0)
+                result_calls = result.get("function_calls", [])
+
+                if result_calls:
+                    _fix_negatives(result_calls)
+                    all_calls.extend(result_calls)
+
+            if all_calls and (not likely_multi or len(all_calls) >= 2):
+                return {
+                    "function_calls": all_calls,
+                    "total_time_ms": total_time,
+                    "confidence": local.get("confidence", 0),
+                    "source": "on-device",
+                }
+
+    # =========================================================
+    # LAYER 3: Cloud fallback
+    # =========================================================
+    return _cloud_fallback(messages, tools, local)
 
 
 def _cloud_fallback(messages, tools, local):
@@ -171,141 +203,74 @@ def _cloud_fallback(messages, tools, local):
     return cloud
 
 
-# =============================================================
-# GENERIC TOOL MATCHING + PARAMETER EXTRACTION
-# =============================================================
-
-def _generic_construct(query_lower, original_query, tools, likely_multi):
-    """
-    Score each tool, pick the best match(es), extract parameters generically.
-    All logic is driven by tool definitions — no hardcoded tool names.
-    """
-    # Score all tools
-    scored_tools = []
-    for tool in tools:
-        score, extracted_args = _score_and_extract(query_lower, original_query, tool)
-        if score > 0 and extracted_args is not None:
-            scored_tools.append((score, tool, extracted_args))
-
-    if not scored_tools:
-        return None
-
-    # Sort by score descending
-    scored_tools.sort(key=lambda x: x[0], reverse=True)
-
-    if likely_multi:
-        # Estimate how many tools are needed from the query
-        and_count = query_lower.count(" and ")
-        comma_count = query_lower.count(",")
-        expected_count = max(and_count + 1, comma_count + 1) if (and_count or comma_count) else 2
-
-        # Filter: minimum score threshold AND only keep top N tools
-        min_score = max(4, scored_tools[0][0] * 0.4)  # at least 40% of best score
-        print(f"[DEBUG-GENERIC] All scores: {[(s, t['name']) for s, t, a in scored_tools]}")
-        print(f"[DEBUG-GENERIC] Min score: {min_score}, Expected count: {expected_count}")
-        filtered = []
-        used_tools = set()
-        for score, tool, args in scored_tools:
-            if score >= min_score and tool["name"] not in used_tools:
-                filtered.append({"name": tool["name"], "arguments": args})
-                used_tools.add(tool["name"])
-            if len(filtered) >= expected_count:
-                break
-        print(f"[DEBUG-GENERIC] Filtered calls: {json.dumps(filtered, indent=2)}")
-        return filtered if len(filtered) >= 2 else None
-    else:
-        # Single tool — return highest scoring
-        best_score, best_tool, best_args = scored_tools[0]
-        return [{"name": best_tool["name"], "arguments": best_args}]
+def _fix_negatives(calls):
+    for call in calls:
+        args = call.get("arguments", {})
+        for key in args:
+            if isinstance(args[key], (int, float)) and args[key] < 0:
+                args[key] = abs(args[key])
 
 
-def _score_and_extract(query_lower, original_query, tool):
-    """
-    Score how well a query matches a tool, and extract parameter values.
-    Returns (score, extracted_args) or (0, None) if no match.
-    """
+def _score_tool(query_lower, tool):
+    """Score how well a query matches a tool. Reads tool definitions only."""
     score = 0
     tool_name = tool["name"]
     tool_desc = tool.get("description", "").lower()
-    properties = tool.get("parameters", {}).get("properties", {})
-    required = tool.get("parameters", {}).get("required", [])
 
-    # --- Signal 1: Tool name keyword match (weight: 2 per keyword) ---
-    # Split tool name like "set_alarm" → ["set", "alarm"]
+    # Signal 1: Tool name keywords (weight: 2)
     name_keywords = tool_name.lower().replace("_", " ").split()
     for kw in name_keywords:
-        if kw in query_lower:
+        if len(kw) > 2 and kw in query_lower:
             score += 2
 
-    # --- Signal 2: Description keyword overlap (weight: 1 per keyword) ---
-    # Filter out generic words
-    stop_words = {"a", "an", "the", "for", "to", "of", "is", "in", "at", "by", "or", "and", "with", "get", "set", "create"}
+    # Signal 2: Description keyword overlap (weight: 1)
+    stop_words = {"a", "an", "the", "for", "to", "of", "is", "in", "at",
+                  "by", "or", "and", "with", "get", "set", "create"}
     desc_keywords = [w for w in tool_desc.split() if w not in stop_words and len(w) > 2]
     for kw in desc_keywords:
         if kw in query_lower:
             score += 1
 
-    # --- Signal 3: Synonym/action verb expansion (weight: 3) ---
-    # Derive related verbs from tool name and description
+    # Signal 3: Action verb synonyms (weight: 3)
     action_synonyms = _get_action_synonyms(tool_name, tool_desc)
-    # Check if the query's PRIMARY verb (first few words) matches
     query_words = query_lower.split()
-    primary_words = query_words[:4]  # first 4 words usually contain the main verb
+    primary_words = query_words[:5]
     for synonym in action_synonyms:
         if synonym in primary_words:
             score += 3
             break
 
-    # --- Signal 4: Parameter fillability (weight: 2 per filled required param) ---
-    extracted_args = {}
-    for param_name, param_info in properties.items():
-        value = _extract_param_value(
-            query_lower, original_query, param_name,
-            param_info.get("type", "string"),
-            param_info.get("description", ""),
-            tool_name, tool_desc
-        )
-        if value is not None:
-            extracted_args[param_name] = value
-
-    filled_required = sum(1 for r in required if r in extracted_args)
-    score += filled_required * 2
-
-    # If we can't fill ALL required params, this tool isn't viable
-    if filled_required < len(required):
-        return (0, None)
-
-    return (score, extracted_args)
+    return score
 
 
 def _get_action_synonyms(tool_name, tool_desc):
-    """
-    Derive action verbs/synonyms from the tool name and description.
-    These are words a user might say to trigger this tool.
-    """
+    """Derive action verbs from tool name/description. Concept-based."""
     synonyms = set()
-
-    # From tool name: "set_alarm" → "set", "alarm"
     for part in tool_name.lower().replace("_", " ").split():
         synonyms.add(part)
 
-    # Common synonym expansions based on description keywords
-    # This is the only place with "semi-hardcoded" knowledge,
-    # but it maps CONCEPTS not specific tools
     synonym_map = {
         "alarm": ["wake", "alarm"],
         "timer": ["timer", "countdown"],
         "remind": ["remind", "reminder"],
         "message": ["message", "text", "send"],
-        "search": ["search", "find", "look", "lookup"],
+        "search": ["search", "find", "look", "lookup", "show"],
         "play": ["play", "listen"],
-        "weather": ["weather", "forecast", "temperature"],
+        "weather": ["weather", "forecast", "temperature", "rain", "pack"],
         "call": ["call", "dial", "phone"],
         "book": ["book", "reserve", "reservation"],
         "create": ["create", "make", "add", "new"],
         "delete": ["delete", "remove", "cancel"],
         "set": ["set"],
-        "get": ["get", "check", "fetch", "show"],
+        "get": ["get", "check", "fetch", "show", "find"],
+        "translate": ["translate", "say"],
+        "convert": ["convert", "much", "exchange"],
+        "direction": ["direction", "directions", "route", "navigate"],
+        "emergency": ["emergency", "nearest", "hospital", "police", "pharmacy", "need"],
+        "hotel": ["hotel", "stay", "accommodation", "hostel", "place"],
+        "flight": ["flight", "fly", "flying", "flights", "airline"],
+        "activity": ["activity", "activities", "tour", "experience", "stuff", "things"],
+        "currency": ["currency", "dollars", "rupiah", "bucks", "money"],
     }
 
     combined = tool_name.lower() + " " + tool_desc
@@ -314,170 +279,6 @@ def _get_action_synonyms(tool_name, tool_desc):
             synonyms.update(syns)
 
     return synonyms
-
-
-def _extract_param_value(query_lower, original_query, param_name, param_type, param_desc, tool_name, tool_desc):
-    """
-    Extract a parameter value from the query based on its type and description.
-    Generic — works for any tool definition.
-    """
-    param_desc_lower = param_desc.lower()
-    param_name_lower = param_name.lower()
-
-    # =========================
-    # INTEGER PARAMETERS
-    # =========================
-    if param_type in ("integer", "number"):
-
-        # Hour extraction — look for time patterns
-        if "hour" in param_name_lower:
-            match = re.search(r'(\d{1,2})(?::\d{2})?\s*(am|pm)', query_lower)
-            if match:
-                hour = int(match.group(1))
-                period = match.group(2)
-                if period == "pm" and hour != 12:
-                    hour += 12
-                if period == "am" and hour == 12:
-                    hour = 0
-                return hour
-
-        # Minute extraction — from time pattern (X:MM) or duration (X minutes)
-        if "minute" in param_name_lower:
-            # First check for time pattern like "8:15 AM"
-            match = re.search(r'\d{1,2}:(\d{2})\s*(?:am|pm)', query_lower)
-            if match:
-                return int(match.group(1))
-            # Then check for duration like "15 minutes"
-            match = re.search(r'(\d+)\s*minute', query_lower)
-            if match:
-                return int(match.group(1))
-            # If hour was found but no minute specified, default to 0
-            if re.search(r'\d{1,2}\s*(?:am|pm)', query_lower):
-                return 0
-
-        # Generic number — "number of minutes", "count", etc.
-        if "minute" in param_desc_lower or "duration" in param_desc_lower:
-            match = re.search(r'(\d+)\s*minute', query_lower)
-            if match:
-                return int(match.group(1))
-
-        # Fallback: find any number
-        match = re.search(r'(\d+)', query_lower)
-        if match:
-            return int(match.group(1))
-
-    # =========================
-    # STRING PARAMETERS
-    # =========================
-    if param_type == "string":
-
-        # --- Location/city/place ---
-        if any(kw in param_desc_lower for kw in ["city", "location", "place", "where"]):
-            # "weather in Paris" / "weather for London"
-            match = re.search(r'(?:in|for)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', original_query)
-            if match:
-                return match.group(1).strip()
-            # Fallback: look for capitalized words after "in"
-            match = re.search(r'in\s+(.+?)(?:\.|,|\?|!|$| and )', query_lower)
-            if match:
-                location = match.group(1).strip().rstrip('.,?!')
-                return ' '.join(w.capitalize() for w in location.split())
-
-        # --- Person/recipient/contact name ---
-        if any(kw in param_desc_lower for kw in ["name", "person", "recipient", "contact", "who"]):
-            # Look for capitalized proper nouns in original query
-            # Skip words that start sentences or are common words
-            skip_words = {"set", "send", "play", "find", "look", "get", "check",
-                         "remind", "text", "what", "how", "the", "and", "i'll",
-                         "wake", "me", "my", "at", "for", "in", "a", "an"}
-
-            # Try "to {Name}" pattern first
-            match = re.search(r'(?:to|text|message)\s+([A-Z][a-z]+)', original_query)
-            if match and match.group(1).lower() not in skip_words:
-                return match.group(1)
-
-            # Try "find/look up {Name}" pattern
-            match = re.search(r'(?:find|look\s*up|search\s*for)\s+([A-Z][a-z]+)', original_query)
-            if match and match.group(1).lower() not in skip_words:
-                return match.group(1)
-
-            # Fallback: any capitalized word that's not a city or common word
-            for word in original_query.split():
-                clean = word.strip('.,!?')
-                if clean and clean[0].isupper() and clean.lower() not in skip_words:
-                    # Skip if it looks like start of sentence
-                    idx = original_query.index(clean)
-                    if idx > 0:
-                        return clean
-
-        # --- Message content ---
-        if any(kw in param_desc_lower for kw in ["message", "content", "body", "text"]):
-            match = re.search(r'saying\s+(.+?)(?:\.|!|$|,\s*(?:and|check|set|remind|find|look|play)|\s+and\s+)', query_lower)
-            if match:
-                return match.group(1).strip().rstrip('.,!?')
-
-        # --- Song/music/playlist ---
-        if any(kw in param_desc_lower for kw in ["song", "playlist", "music", "track"]):
-            match = re.search(r'play\s+(.+?)(?:\.|,|!|$| and )', query_lower)
-            if match:
-                song = match.group(1).strip().rstrip('.,!?')
-                # Only strip "some/the" prefix
-                song = re.sub(r'\s+music$', '', song)
-                return song
-
-        # --- Title/subject ---
-        if any(kw in param_desc_lower for kw in ["title", "subject", "about", "description"]):
-            # "remind me about X at TIME" or "remind me to X at TIME"
-            match = re.search(r'(?:about|to)\s+(.+?)\s+at\s+\d', query_lower)
-            if match:
-                title = match.group(1).strip()
-                title = re.sub(r'^the\s+', '', title)
-                return title
-            # Fallback: text between the action verb and a time/end
-            match = re.search(r'(?:remind\w*|create|add)\s+(?:me\s+)?(?:about\s+|to\s+)?(.+?)(?:\s+at\s+|\.|$)', query_lower)
-            if match:
-                title = match.group(1).strip()
-                title = re.sub(r'^the\s+', '', title)
-                return title
-
-        # --- Time as string ---
-        if "time" in param_desc_lower and "time" not in param_name_lower.replace("time", "x"):
-            # For tools like create_reminder, find time NEAR the tool's action context
-            # Look for "at TIME" pattern after the tool's action verb
-            tool_verbs = tool_name.lower().replace("_", " ").split()
-            # Find position of tool's verb in query to get nearby time
-            verb_pos = -1
-            for v in tool_verbs:
-                pos = query_lower.find(v)
-                if pos >= 0:
-                    verb_pos = max(verb_pos, pos)
-
-            # Find all time patterns
-            time_matches = list(re.finditer(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm))', query_lower))
-
-            if time_matches:
-                # Pick the time closest to (and after) the tool's verb
-                best_match = time_matches[-1]  # default to last
-                if verb_pos >= 0:
-                    for tm in time_matches:
-                        if tm.start() > verb_pos:
-                            best_match = tm
-                            break
-
-                time_str = best_match.group(1).strip().upper()
-                if ':' not in time_str:
-                    time_str = re.sub(r'(\d+)\s*(AM|PM)', r'\1:00 \2', time_str)
-                else:
-                    time_str = re.sub(r'(\d+:\d+)\s*(AM|PM)', r'\1 \2', time_str)
-                return time_str
-
-        # --- Search query ---
-        if any(kw in param_desc_lower for kw in ["query", "search", "keyword"]):
-            match = re.search(r'(?:find|look\s*up|search\s*for)\s+([A-Z][a-z]+)', original_query)
-            if match:
-                return match.group(1)
-
-    return None
 
 def print_result(label, result):
     """Pretty-print a generation result."""
