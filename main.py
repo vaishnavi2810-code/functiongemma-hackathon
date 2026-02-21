@@ -128,7 +128,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.85):
     # STEP 2: Confidence check
     # =========================================================
     if local.get("confidence", 0) < confidence_threshold:
-        # Before cloud, try regex for low-confidence cases too
         if not calls:
             constructed = _try_construct_calls(query_lower, tool_names, likely_multi)
             if constructed:
@@ -161,7 +160,6 @@ def generate_hybrid(messages, tools, confidence_threshold=0.85):
     # STEP 5: Multi-tool check
     # =========================================================
     if likely_multi and len(calls) < 2:
-        # Try to construct the full multi-tool call set
         constructed = _try_construct_calls(query_lower, tool_names, likely_multi)
         if constructed and len(constructed) >= 2:
             local["function_calls"] = constructed
@@ -193,19 +191,16 @@ def _try_construct_calls(query, tool_names, likely_multi):
 
     # --- get_weather ---
     if "get_weather" in tool_names:
-        # Match "weather in {location}"
         match = re.search(r'weather\s+(?:like\s+)?(?:in|for)\s+(.+?)(?:\.|,|\?|!|$| and )', query)
         if not match:
             match = re.search(r'(?:check|get)\s+(?:the\s+)?weather\s+(?:in|for)\s+(.+?)(?:\.|,|\?|!|$| and )', query)
         if match:
             location = match.group(1).strip().rstrip('.,?!')
-            # Title case for city names
             location = ' '.join(w.capitalize() for w in location.split())
             calls.append({"name": "get_weather", "arguments": {"location": location}})
 
     # --- set_alarm ---
     if "set_alarm" in tool_names:
-        # Match time like "6 AM", "10 AM", "7:30 AM", "8:15 AM"
         match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)', query)
         if match and any(w in query for w in ["alarm", "wake"]):
             hour = int(match.group(1))
@@ -228,21 +223,25 @@ def _try_construct_calls(query, tool_names, likely_multi):
         match = re.search(r'play\s+(.+?)(?:\.|,|!|$| and )', query)
         if match:
             song = match.group(1).strip().rstrip('.,!?')
-            # Clean up common prefixes
+            had_some = bool(re.match(r'(?:some|the)\s+', song))
             song = re.sub(r'^(?:some|the)\s+', '', song)
+            if had_some:
+                song = re.sub(r'\s+music$', '', song)
             calls.append({"name": "play_music", "arguments": {"song": song}})
 
     # --- send_message ---
     if "send_message" in tool_names:
-        # "message to X saying Y" or "text X saying Y"
         match = re.search(r'(?:message|text)\s+(?:to\s+)?(\w+)\s+saying\s+(.+?)(?:\.|,|!|$| and )', query)
         if not match:
-            # "send him/her a message saying Y" — need to find name elsewhere
             match = re.search(r'(?:send|text)\s+(\w+)\s+(?:a\s+)?(?:message\s+)?saying\s+(.+?)(?:\.|,|!|$| and )', query)
         if match:
             recipient = match.group(1).strip().capitalize()
             message_text = match.group(2).strip().rstrip('.,!?')
-            if recipient.lower() not in ["a", "the", "me", "him", "her"]:
+            if recipient.lower() in ["him", "her", "them"]:
+                name_match = re.search(r'(?:find|look\s*up|search\s*for|contact)\s+(\w+)', query)
+                if name_match:
+                    recipient = name_match.group(1).strip().capitalize()
+            if recipient.lower() not in ["a", "the", "me", "him", "her", "them"]:
                 calls.append({"name": "send_message", "arguments": {"recipient": recipient, "message": message_text}})
 
     # --- create_reminder ---
@@ -250,9 +249,8 @@ def _try_construct_calls(query, tool_names, likely_multi):
         match = re.search(r'remind\s+(?:me\s+)?(?:about\s+|to\s+)?(.+?)\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm))', query)
         if match:
             title = match.group(1).strip()
-            time_str = match.group(2).strip()
-            # Normalize time format: "3:00 pm" -> "3:00 PM"
-            time_str = time_str.upper()
+            title = re.sub(r'^the\s+', '', title)
+            time_str = match.group(2).strip().upper()
             if ':' not in time_str:
                 time_str = re.sub(r'(\d+)\s*(AM|PM)', r'\1:00 \2', time_str)
             else:
@@ -266,94 +264,18 @@ def _try_construct_calls(query, tool_names, likely_multi):
             name = match.group(1).strip().capitalize()
             calls.append({"name": "search_contacts", "arguments": {"query": name}})
 
-    # Return None if we couldn't construct anything
     if not calls:
         return None
 
-    # For single-tool queries, return what we found
+    print(f"[DEBUG-REGEX] Constructed calls: {calls}")
+
     if not likely_multi:
         return [calls[0]] if calls else None
 
-    # For multi-tool queries, only return if we got 2+
     if len(calls) >= 2:
         return calls
 
     return None
-
-#Hitika idea due to the Paris query
-# def generate_hybrid(messages, tools, confidence_threshold=0.85):
-#     """Threshold 0.99 + validation + fix negatives locally."""
-#
-#     local = generate_cactus(messages, tools)
-#     print(f"[DEBUG-RAW] Full local response: {local}")
-#     user_query = messages[-1]["content"]
-#     print(f"\n[DEBUG] Query: {user_query}")
-#     print(f"[DEBUG] Confidence: {local['confidence']}")
-#     print(f"[DEBUG] Function calls: {json.dumps(local['function_calls'], indent=2)}")
-#     print(f"[DEBUG] Tools available: {[t['name'] for t in tools]}")
-#     calls = local.get("function_calls", [])
-#
-#     # --- Baseline confidence check ---
-#     if local["confidence"] < confidence_threshold:
-#         cloud = generate_cloud(messages, tools)
-#         cloud["source"] = "cloud (fallback)"
-#         cloud["local_confidence"] = local["confidence"]
-#         cloud["total_time_ms"] += local["total_time_ms"]
-#         return cloud
-#
-#     # --- Validation 1: No empty function calls ---
-#     if not calls:
-#         cloud = generate_cloud(messages, tools)
-#         cloud["source"] = "cloud (fallback)"
-#         cloud["local_confidence"] = local["confidence"]
-#         cloud["total_time_ms"] += local["total_time_ms"]
-#         return cloud
-#
-#     # --- Fix: Convert negative numeric values to positive ---
-#     # FunctionGemma sometimes negates numbers. The right function
-#     # and right magnitude, just wrong sign. Fix it locally.
-#     for call in calls:
-#         args = call.get("arguments", {})
-#         for key in args:
-#             if isinstance(args[key], (int, float)) and args[key] < 0:
-#                 args[key] = abs(args[key])
-#
-#     # --- Validation 2: Multi-tool queries need multiple calls ---
-#     user_query = ""
-#     for m in messages:
-#         if m["role"] == "user":
-#             user_query = m["content"].lower()
-#
-#     multi_keywords = [" and ", " also ", " then ", " plus "]
-#     likely_multi = any(kw in f" {user_query} " for kw in multi_keywords)
-#
-#     if likely_multi and len(calls) < 2:
-#         cloud = generate_cloud(messages, tools)
-#         cloud["source"] = "cloud (fallback)"
-#         cloud["local_confidence"] = local["confidence"]
-#         cloud["total_time_ms"] += local["total_time_ms"]
-#         return cloud
-#
-#     # --- All checks passed, trust local ---
-#     local["source"] = "on-device"
-#     return local
-
-# Original GENERATE HYBRID function
-# def generate_hybrid(messages, tools, confidence_threshold=0.99):
-#     """Baseline hybrid inference strategy; fall back to cloud if Cactus Confidence is below threshold."""
-#         local = generate_cactus(messages, tools)
-#
-#         if local["confidence"] >= confidence_threshold:
-#             local["source"] = "on-device"
-#             return local
-#
-#         cloud = generate_cloud(messages, tools)
-#         cloud["source"] = "cloud (fallback)"
-#         cloud["local_confidence"] = local["confidence"]
-#         cloud["total_time_ms"] += local["total_time_ms"]
-#         return cloud
-
-
 
 def print_result(label, result):
     """Pretty-print a generation result."""
