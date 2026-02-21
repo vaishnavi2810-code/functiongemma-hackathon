@@ -13,6 +13,9 @@ import concurrent.futures
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
+from datetime import datetime
+current_year = str(datetime.now().year)
+
 
 
 def generate_cactus(messages, tools):
@@ -206,9 +209,12 @@ def _cloud_fallback(messages, tools, local):
 def _fix_negatives(calls):
     for call in calls:
         args = call.get("arguments", {})
-        for key in args:
-            if isinstance(args[key], (int, float)) and args[key] < 0:
-                args[key] = abs(args[key])
+        for key, val in args.items():
+            if isinstance(val, str) and re.match(r'20\d{2}-\d{2}-\d{2}', val):
+                # Replace any past year with current year
+                year_in_val = val[:4]
+                if int(year_in_val) < int(current_year):
+                    args[key] = current_year + val[4:]
 
 
 def _score_tool(query_lower, tool):
