@@ -95,7 +95,7 @@ def generate_cloud(messages, tools):
         "total_time_ms": total_time_ms,
     }
 
-def generate_hybrid(messages, tools, confidence_threshold=0.85):
+def generate_hybrid(messages, tools, confidence_threshold=0.93):
     """
     Three-layer fallback:
     1. FunctionGemma (AI, ~200ms)
